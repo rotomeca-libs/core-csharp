@@ -10,6 +10,10 @@
     <Version>1.0.0</Version>
     <Description>Méta-package Rotomeca.Core, il regroupe Collections et Optionals.</Description>
     <Authors>Rotomeca</Authors>
+    <Copyright>© Rotomeca</Copyright>
+    <PackageProjectUrl>https://github.com/rotomeca-libs/core-csharp</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/rotomeca-libs/core-csharp</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageIcon>icon.png</PackageIcon>
     <PackageLicenseExpression>ISC</PackageLicenseExpression>

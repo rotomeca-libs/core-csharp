@@ -1,0 +1,152 @@
+name: Release
+
+# Publication du méta-package Rotomeca.Core sur NuGet.
+#
+# Déclencheurs :
+#   - tag de version poussé à la main (ex. : git flow release finish 1.1.0 && git push --tags) : publication directe ;
+#   - repository_dispatch « dependency-released » envoyé par le release.yml de core-optionals-csharp / core-collections-csharp ;
+#   - vérification quotidienne de NuGet (filet de sécurité) ou lancement manuel.
+#   Dans ces trois derniers cas, si Collections ou Optionals a une nouvelle version, le job « bump » met à jour
+#   les PackageReference, incrémente le patch de Rotomeca.Core, commite et tague sur main (puis fusionne dans develop)
+#   et le job « publish » publie la nouvelle version.
+#
+# Authentification par Trusted Publishing (OIDC) : aucune clé API stockée.
+# Prérequis :
+#   - règle Trusted Publishing sur nuget.org (owner rotomeca-libs, repo core-csharp, workflow release.yml) ;
+#   - variable de dépôt NUGET_USER (Settings > Secrets and variables > Actions > Variables) contenant le nom de profil nuget.org (pas l'e-mail) ;
+#   - GitHub Actions autorisé à pousser sur main et develop (Settings > Actions > General > Workflow permissions : Read and write).
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+      - "[0-9]+.[0-9]+.[0-9]+*"
+  repository_dispatch:
+    types:
+      - dependency-released
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write  # requis pour pousser le commit et le tag de montée de version
+  id-token: write  # requis pour obtenir le jeton OIDC
+
+# Une seule montée de version à la fois : si les deux dépendances sortent en même temps, les exécutions s'enchaînent.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Bump dependencies
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      bumped: ${{ steps.bump.outputs.bumped }}
+      version: ${{ steps.bump.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Check NuGet versions
+        id: bump
+        env:
+          PACKAGE: ${{ github.event.client_payload.package }}
+          VERSION: ${{ github.event.client_payload.version }}
+        run: bash scripts/bump-dependencies.sh Rotomeca.Core/Rotomeca.Core.csproj "$PACKAGE" "$VERSION"
+
+      - name: Commit & tag
+        if: steps.bump.outputs.bumped == 'true'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "build: :bookmark: $VERSION"
+          git tag "$VERSION"
+          git push origin main "refs/tags/$VERSION"
+
+      # Report de la montée de version sur develop (git-flow). Un conflit n'empêche pas la publication.
+      - name: Merge into develop
+        if: steps.bump.outputs.bumped == 'true'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          git checkout develop
+          if git merge --no-ff --no-edit -m "Merge tag '$VERSION' into develop" main; then
+            git push origin develop
+          else
+            git merge --abort
+            echo "::warning::Impossible de fusionner main dans develop automatiquement : à faire à la main."
+          fi
+
+  publish:
+    name: Pack & Publish
+    needs: bump
+    # always() : le job doit tourner même quand « bump » est ignoré (push de tag).
+    if: always() && (github.event_name == 'push' || needs.bump.outputs.bumped == 'true')
+    runs-on: ubuntu-latest
+
+    steps:
+      # Version déduite du tag (v1.1.0 ou 1.1.0 -> 1.1.0) ou de la montée de version automatique.
+      - name: Version
+        id: version
+        env:
+          BUMPED_VERSION: ${{ needs.bump.outputs.version }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            echo "ref=$GITHUB_REF" >> "$GITHUB_OUTPUT"
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=refs/tags/$BUMPED_VERSION" >> "$GITHUB_OUTPUT"
+            echo "value=$BUMPED_VERSION" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.version.outputs.ref }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Pack
+        run: >
+          dotnet pack Rotomeca.Core
+          --no-restore
+          --configuration Release
+          --output ./artifacts
+          -p:Version=${{ steps.version.outputs.value }}
+
+      # Échange le jeton OIDC de GitHub contre une clé API temporaire (~1 h, usage unique).
+      - name: NuGet login (OIDC)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      - name: Push to NuGet
+        run: >
+          dotnet nuget push ./artifacts/*.nupkg
+          --api-key ${{ steps.login.outputs.NUGET_API_KEY }}
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-packages
+          path: ./artifacts/*
+          retention-days: 30
